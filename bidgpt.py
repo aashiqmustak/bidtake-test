@@ -5,7 +5,7 @@ What it does
 ------------
 1. Selects a local contractor PDF (file picker or command-line path).
 2. Sends the original PDF directly to the OpenAI Responses API.
-3. Extracts takeoff scope only; quantities are populated only when explicitly stated.
+3. Extracts takeoff scope and the quoted proposal total; quantities only when explicitly stated.
 4. Runs a separate GPT review pass to catch omissions, conflicts, and questionable values.
 5. Validates source references and leaves unstated quantities blank.
 6. Exports formatted Excel (.xlsx), flat CSV (.csv), and full JSON (.json).
@@ -70,7 +70,7 @@ except ImportError:
     raise SystemExit(2)
 
 
-MODEL = os.getenv("OPENAI_MODEL", "gpt-6.1-sol").strip()
+MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1").strip() or "gpt-4.1"
 REVIEW_MODEL = os.getenv("OPENAI_REVIEW_MODEL", MODEL).strip() or MODEL
 PDF_DETAIL = os.getenv("OPENAI_PDF_DETAIL", "high").strip() or "high"
 MAX_MB = int(os.getenv("MAX_UPLOAD_SIZE_MB", "45"))
@@ -125,14 +125,33 @@ SCHEMA: dict[str, Any] = {'type': 'object',
                                                  'review_reasons',
                                                  'quantity_explicitly_stated']}},
                 'review_flags': {'type': 'array', 'items': {'type': 'string'}},
-                'pages_processed': {'type': ['integer', 'null']}},
- 'required': ['filename', 'project_metadata', 'items', 'review_flags', 'pages_processed']}
+                'pages_processed': {'type': ['integer', 'null']},
+                'quoted_total': {'type': 'object',
+                                 'additionalProperties': False,
+                                 'properties': {'amount': {'type': ['number', 'null']},
+                                                'currency': {'type': ['string', 'null']},
+                                                'source_page': {'type': ['integer', 'null']},
+                                                'source_evidence': {'type': ['string', 'null']}},
+                                 'required': ['amount',
+                                              'currency',
+                                              'source_page',
+                                              'source_evidence']}},
+ 'required': ['filename',
+              'project_metadata',
+              'items',
+              'review_flags',
+              'pages_processed',
+              'quoted_total']}
 
 EXTRACTION_INSTRUCTIONS = """
 You are a construction quantity-takeoff document analyst. Read every page of the PDF.
 Extract ONLY physical takeoff items and installation/work activities in the proposed scope.
 Keep unquantified scope items, but leave their quantity and unit null unless explicitly stated.
-Exclude prices, totals, taxes, payment schedules, recurring service fees, warranties,
+Also extract the explicitly quoted base proposal total into quoted_total, with its currency
+(if stated), source page and exact supporting excerpt. Never calculate or sum this total.
+Do not add alternates or recurring fees. If no clear total is stated, return amount=null;
+if totals conflict, leave amount=null and add a review flag.
+Exclude item prices, tax breakdowns, payment schedules, recurring service fees, warranties,
 exclusions, customer responsibilities and commercial/contract conditions.
 Keep physical alternate scope items in clearly labeled alternate sections, separate from base scope.
 Use only information in this PDF. Preserve separate source rows and their descriptions.
@@ -282,6 +301,17 @@ def validate_and_flag(data: dict[str, Any], pdf_path: Path) -> dict[str, Any]:
         item["review_reasons"] = list(dict.fromkeys(str(x) for x in reasons))
         item["review_required"] = bool(item.get("review_required") or reasons)
         items.append(item)
+    total = data.get("quoted_total") or {}
+    total = {key: total.get(key) for key in SCHEMA["properties"]["quoted_total"]["properties"]}
+    amount = total.get("amount")
+    if amount is not None and not (
+        type(amount) in (int, float) and math.isfinite(amount) and amount >= 0
+        and type(total.get("source_page")) is int and total["source_page"] > 0
+        and str(total.get("source_evidence") or "").strip()
+    ):
+        total["amount"] = None
+        flags.append("Quoted total omitted: valid amount and source reference required.")
+    data["quoted_total"] = total
     data["items"] = items
     if not items:
         flags.append("No takeoff items extracted; verify source scope.")
@@ -306,7 +336,7 @@ def review_with_second_pass(client: OpenAI, pdf_bytes: bytes, pdf_name: str,
 Independently audit the first-pass JSON against every page of the original PDF.
 Correct omissions, merged/duplicate rows, quantities, units and source references.
 Remove non-takeoff entries. Clear any quantity that is not explicitly stated or cannot be
-verified, and flag uncertain quantities. Do not restore pricing or commercial information.
+verified, and flag uncertain quantities. Verify the quoted proposal total as well. Do not restore item pricing or commercial terms.
 Return the full corrected JSON using the supplied schema.
 """
 
@@ -449,6 +479,11 @@ def export_excel(data: dict[str, Any], output_path: Path) -> None:
     ]:
         ws.append([label, value if value is not None else "Not stated", None, None, None])
         ws.cell(ws.max_row, 1).font = Font(bold=True)
+    total = data.get("quoted_total") or {}
+    ws.append(["QUOTED TOTAL:", total.get("amount") if total.get("amount") is not None else "Not stated",
+               None, total.get("currency") or "", total.get("source_evidence") or ""])
+    ws.cell(ws.max_row, 1).font = Font(bold=True)
+    ws.cell(ws.max_row, 2).number_format = '#,##0.00'
     ws.append([])
     ws.append(["S.No.", "Description", "Quantity", "Unit", "Notes / Review"])
     header_row = ws.max_row
@@ -518,14 +553,19 @@ def export_csv(data: dict[str, Any], output_path: Path) -> None:
     with output_path.open("w", newline="", encoding="utf-8-sig") as handle:
         writer = csv.writer(handle)
         writer.writerow(["Item #", "Section", "Description", "Model Number", "Item Code",
-                         "Quantity", "Unit", "Source Page", "Review Reasons", "Source Evidence"])
+                         "Quantity", "Unit", "Source Page", "Review Reasons", "Source Evidence", "Quoted Total", "Currency"])
         for idx, item in enumerate(data.get("items", []), 1):
             writer.writerow([
                 item.get("item_number") or idx, item.get("section"), item.get("description"),
                 item.get("model_number"), item.get("item_code"), item.get("quantity"),
                 item.get("unit"), item.get("source_page"),
-                "; ".join(item.get("review_reasons") or []), item.get("source_evidence"),
+                "; ".join(item.get("review_reasons") or []), item.get("source_evidence"), "", "",
             ])
+
+        total = data.get("quoted_total") or {}
+        writer.writerow(["", "Proposal Summary", "Quoted Total", "", "", "", "",
+                         total.get("source_page"), "", total.get("source_evidence"),
+                         total.get("amount"), total.get("currency")])
 
 
 def safe_stem(filename: str) -> str:
