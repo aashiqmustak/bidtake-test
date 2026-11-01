@@ -70,7 +70,7 @@ except ImportError:
     raise SystemExit(2)
 
 
-MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1").strip() or "gpt-4.1"
+MODEL = os.getenv("OPENAI_MODEL", "gpt-6.1-sol").strip() or "gpt-4.1"
 REVIEW_MODEL = os.getenv("OPENAI_REVIEW_MODEL", MODEL).strip() or MODEL
 PDF_DETAIL = os.getenv("OPENAI_PDF_DETAIL", "high").strip() or "high"
 MAX_MB = int(os.getenv("MAX_UPLOAD_SIZE_MB", "45"))
